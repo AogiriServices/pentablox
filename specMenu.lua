@@ -6,10 +6,17 @@
 	and BODY parts live using CFrame offsets.
 
 	Toggle the menu with the DELETE key.
-	Every slider value is applied as a CFrame translation on the affected part.
 
-	Load it inside an executor with:
-	  local spec = loadstring(game:HttpGet("https://raw.githubusercontent.com/AogiriServices/pentablox/main/specMenu.lua"))()
+	Why CFrame changes need a loop:
+	  Roblox re-applies character physics/animation every frame, so a one-time
+	  head.CFrame = ... gets overwritten within a frame. To keep the offset
+	  ("desync") alive we re-apply it on RenderStepped.
+
+	Debug visualization:
+	  The "Show Desync" button renders a red wireframe SelectionBox + a live
+	  BillboardGui readout on each affected part, so you can actually SEE where
+	  the fake offset is pointing (from your own camera, where you normally
+	  can't see your own head/torso moving).
 ]]
 
 local Players = game:GetService("Players")
@@ -38,45 +45,138 @@ end
 
 local MAX_STUDS = 6
 
--- Names of the parts we can move. On R6 it's "Torso"; on R15 it's "UpperTorso".
 local OFFSETS = {
 	HeadX  = 0, HeadY  = 0, HeadZ  = 0,
 	BodyX  = 0, BodyY  = 0, BodyZ  = 0,
+}
+
+-- Which parts carry which offsets, and how to find them per rig.
+local PARTS = {
+	{ name = "Head",   find = function(c) return c:FindFirstChild("Head")   end, offset = "Head"  },
+	{ name = "Body",   find = function(c)
+		if c:FindFirstChild("UpperTorso") then return c:FindFirstChild("UpperTorso") end
+		if c:FindFirstChild("Torso")        then return c:FindFirstChild("Torso")        end
+		return nil end, offset = "Body" },
 }
 
 local function getCharacter()
 	return player.Character or player.CharacterAdded:Wait()
 end
 
--- R15 -> UpperTorso, R6 -> Torso.
-local function getBodyPart()
-	local char = getCharacter()
-	if char:FindFirstChild("UpperTorso") then return char:FindFirstChild("UpperTorso") end
-	if char:FindFirstChild("Torso") then return char:FindFirstChild("Torso") end
-	return nil
-end
-
 -- Applies every stored offset as a CFrame relative to the part's parent,
--- which keeps the parts attached for both R6 and R15.
+-- which keeps the parts attached for both R6 and R15. Called every frame.
 local function applySpecs()
 	local char = getCharacter()
-	local head = char:FindFirstChild("Head")
-	local body = getBodyPart()
+	if not char then return end
 
-	if head and head.Parent then
-		head.CFrame = head.Parent.CFrame * CFrame.new(OFFSETS.HeadX, OFFSETS.HeadY, OFFSETS.HeadZ)
-	end
-
-	if body and body.Parent then
-		body.CFrame = body.Parent.CFrame * CFrame.new(OFFSETS.BodyX, OFFSETS.BodyY, OFFSETS.BodyZ)
+	for _, spec in ipairs(PARTS) do
+		local part = spec:find(char)
+		if part and part.Parent then
+			local off = OFFSETS[spec.offset .. "X"]
+				* Vector3.new(1, 0, 0)
+			+ OFFSETS[spec.offset .. "Y"]
+				* Vector3.new(0, 1, 0)
+			+ OFFSETS[spec.offset .. "Z"]
+				* Vector3.new(0, 0, 1)
+			part.CFrame = part.Parent.CFrame * CFrame.new(off)
+		end
 	end
 end
 
--- Re-apply after every respawn so the offsets stick to the new rig.
-player.CharacterAdded:Connect(function(char)
-	RunService.RenderStepped:Wait() -- let the rig finish assembling
-	applySpecs()
-end)
+-- Continuous loop so the offset survives physics/animation each frame.
+RunService.RenderStepped:Connect(applySpecs)
+
+-- ---------------------------------------------------------------------------
+-- Debug visualization: show where the fake desync is
+-- ---------------------------------------------------------------------------
+
+local debugEnabled = false
+local debugObjects = {}
+
+local function makeReadout(name, offsetKey)
+	local bg = Instance.new("BillboardGui")
+	bg.Name = name .. "_Readout"
+	bg.AlwaysOnTop = true
+	bg.Size = UDim2.new(0, 180, 0, 48)
+	bg.StudsOffset = Vector3.new(0, 2.5, 0)
+	bg.Parent = player:WaitForChild("PlayerGui")
+
+	local frame = Instance.new("Frame")
+	frame.Size = UDim2.new(1, 0, 1, 0)
+	frame.BackgroundColor3 = Color3.fromRGB(20, 20, 22)
+	frame.BackgroundTransparency = 0.15
+	frame.BorderSizePixel = 0
+	frame.Parent = bg
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 4)
+	corner.Parent = frame
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(220, 38, 38)
+	stroke.Thickness = 1
+	stroke.Parent = frame
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, -8, 0, 20)
+	title.Position = UDim2.new(0, 6, 0, 3)
+	title.BackgroundTransparency = 1
+	title.Text = name
+	title.TextColor3 = Color3.fromRGB(255, 90, 90)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 12
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Parent = frame
+
+	local value = Instance.new("TextLabel")
+	value.Name = "Value"
+	value.Size = UDim2.new(1, -8, 0, 24)
+	value.Position = UDim2.new(0, 6, 0, 24)
+	value.BackgroundTransparency = 1
+	value.TextColor3 = Color3.fromRGB(220, 220, 220)
+	value.Font = Enum.Font.GothamMono
+	value.TextSize = 11
+	value.TextXAlignment = Enum.TextXAlignment.Left
+	value.Parent = frame
+
+	bg.Parent = part -- set below once we have the part
+	return bg, value, frame
+end
+
+local function enableDebug()
+	debugEnabled = true
+	local char = getCharacter()
+
+	for _, spec in ipairs(PARTS) do
+		local part = spec:find(char)
+		if not part then continue end
+
+		-- Wireframe showing the part's actual bounds (the desync position).
+		local box = Instance.new("SelectionBox")
+		box.Name = spec.name .. "_Box"
+		box.Color3 = Color3.fromRGB(220, 38, 38)
+		box.LineThickness = 0.03
+		box.Adornee = part
+		box.Visible = true
+		box.Parent = part
+
+		-- Live readout of the current offset + world position.
+		local bg, value, frame = makeReadout(spec.name, spec.offset)
+		bg.Adornee = part
+		table.insert(debugObjects, box)
+		table.insert(debugObjects, { bg = bg, value = value, name = spec.name })
+	end
+end
+
+local function disableDebug()
+	debugEnabled = false
+	for _, obj in ipairs(debugObjects) do
+		if obj.Parent then
+			obj:Destroy()
+		end
+	end
+	debugObjects = {}
+end
 
 -- ---------------------------------------------------------------------------
 -- Custom slider widget (the Vantura lib ships without sliders)
@@ -125,7 +225,6 @@ local function buildSlider(tab, name, value, callback)
 	valueLabel.TextXAlignment = Enum.TextXAlignment.Left
 	valueLabel.Parent = el
 
-	-- Slider track
 	local bar = Instance.new("Frame")
 	bar.Size = UDim2.new(0.5, -10, 0, 6)
 	bar.Position = UDim2.new(0.4, 12, 0, 24)
@@ -214,7 +313,7 @@ end
 
 local GUI = Vantura:Create({
 	Name = "Pentablox",
-	Size = UDim2.fromOffset(640, 440),
+	Size = UDim2.fromOffset(660, 480),
 })
 
 local specsTab = GUI:Tab({
@@ -222,23 +321,30 @@ local specsTab = GUI:Tab({
 	Icon = "https://raw.githubusercontent.com/Femfus/menu-lib/main/icons/aimbot.png",
 })
 
--- Head sliders
-buildSlider(specsTab, "Head X", OFFSETS.HeadX, function(k, v) OFFSETS[k] = v; applySpecs() end)
-buildSlider(specsTab, "Head Y", OFFSETS.HeadY, function(k, v) OFFSETS[k] = v; applySpecs() end)
-buildSlider(specsTab, "Head Z", OFFSETS.HeadZ, function(k, v) OFFSETS[k] = v; applySpecs() end)
+buildSlider(specsTab, "Head X", OFFSETS.HeadX, function(k, v) OFFSETS[k] = v end)
+buildSlider(specsTab, "Head Y", OFFSETS.HeadY, function(k, v) OFFSETS[k] = v end)
+buildSlider(specsTab, "Head Z", OFFSETS.HeadZ, function(k, v) OFFSETS[k] = v end)
+buildSlider(specsTab, "Body X", OFFSETS.BodyX, function(k, v) OFFSETS[k] = v end)
+buildSlider(specsTab, "Body Y", OFFSETS.BodyY, function(k, v) OFFSETS[k] = v end)
+buildSlider(specsTab, "Body Z", OFFSETS.BodyZ, function(k, v) OFFSETS[k] = v end)
 
--- Body sliders
-buildSlider(specsTab, "Body X", OFFSETS.BodyX, function(k, v) OFFSETS[k] = v; applySpecs() end)
-buildSlider(specsTab, "Body Y", OFFSETS.BodyY, function(k, v) OFFSETS[k] = v; applySpecs() end)
-buildSlider(specsTab, "Body Z", OFFSETS.BodyZ, function(k, v) OFFSETS[k] = v; applySpecs() end)
+specsTab:Button({
+	Name = "Show / Hide Desync",
+	Description = "Wireframe + live position readout on each part.",
+	Callback = function()
+		if debugEnabled then
+			disableDebug()
+		else
+			enableDebug()
+		end
+	end,
+})
 
--- Reset button
 specsTab:Button({
 	Name = "Reset Spec Offsets",
 	Description = "Moves every part back to its default CFrame.",
 	Callback = function()
 		for k in pairs(OFFSETS) do OFFSETS[k] = 0 end
-		applySpecs()
 		GUI:Notification({
 			Name = "Specs Reset",
 			Description = "All offsets returned to zero.",
@@ -257,25 +363,13 @@ GUI:Notification({
 -- DELETE key toggle
 -- ---------------------------------------------------------------------------
 
--- Bracket lookup so it resolves on older Roblox clients too.
 local DELETE_KEY = Enum.KeyCode["Delete"] or Enum.KeyCode.Delete
 
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	if gameProcessed then return end
 	if input.KeyCode == DELETE_KEY then
-		local enabled = not GUI.ScreenGui.Enabled
-		GUI.ScreenGui.Enabled = enabled
-		if enabled then
-			applySpecs()
-		end
+		GUI.ScreenGui.Enabled = not GUI.ScreenGui.Enabled
 	end
 end)
-
--- Apply once the character exists.
-local char = getCharacter()
-if char then
-	RunService.RenderStepped:Wait()
-	applySpecs()
-end
 
 print("[Pentablox] Spec menu initialized. Toggle with DELETE.")
